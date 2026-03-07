@@ -44,8 +44,10 @@ function archiviomd_uninstall_cleanup() {
     // 1. Delete all document metadata (UUIDs, checksums, changelogs)
     //    Pattern: mdsm_doc_meta_*
     $wpdb->query(
-        "DELETE FROM {$wpdb->options} 
-         WHERE option_name LIKE 'mdsm_doc_meta_%'"
+        $wpdb->prepare(
+            "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s",
+            $wpdb->esc_like( 'mdsm_doc_meta_' ) . '%'
+        )
     );
     
     // 2. Delete plugin configuration options
@@ -64,6 +66,40 @@ function archiviomd_uninstall_cleanup() {
         'archivio_post_show_badge',
         'archivio_hash_algorithm',
         'archivio_hmac_mode',
+        // Ed25519 signing options.
+        'archiviomd_ed25519_enabled',
+        'archiviomd_ed25519_dsse_enabled',
+        'archiviomd_ed25519_post_types',
+        // SLH-DSA signing options.
+        'archiviomd_slhdsa_enabled',
+        'archiviomd_slhdsa_dsse_enabled',
+        'archiviomd_slhdsa_param',
+        'archiviomd_slhdsa_post_types',
+        // ECDSA signing options.
+        'archiviomd_ecdsa_enabled',
+        'archiviomd_ecdsa_dsse_enabled',
+        'archiviomd_ecdsa_post_types',
+        'archiviomd_ecdsa_key_path',
+        'archiviomd_ecdsa_cert_path',
+        'archiviomd_ecdsa_ca_path',
+        // RSA compatibility signing options.
+        'archiviomd_rsa_enabled',
+        'archiviomd_rsa_scheme',
+        'archiviomd_rsa_post_types',
+        'archiviomd_rsa_key_path',
+        'archiviomd_rsa_cert_path',
+        // CMS / PKCS#7 signing options.
+        'archiviomd_cms_enabled',
+        'archiviomd_cms_post_types',
+        // JSON-LD / W3C Data Integrity options.
+        'archiviomd_jsonld_enabled',
+        'archiviomd_jsonld_post_types',
+        // DANE / DNS Key Corroboration options.
+        'archiviomd_dane_enabled',
+        'archiviomd_dane_tlsa_enabled',
+        'archiviomd_dane_rotation_mode',
+        'archiviomd_dane_rotation_started_at',
+        'archiviomd_dane_cron_notice',
     );
     
     foreach ($plugin_options as $option_name) {
@@ -76,7 +112,94 @@ function archiviomd_uninstall_cleanup() {
         "DELETE FROM {$wpdb->postmeta} 
          WHERE meta_key IN ('_archivio_post_hash', '_archivio_post_algorithm', '_archivio_post_author_id', '_archivio_post_timestamp', '_archivio_post_badge_visible', '_archivio_post_mode')"
     );
+
+    // Delete Ed25519 signing post meta.
+    $wpdb->query(
+        "DELETE FROM {$wpdb->postmeta}
+         WHERE meta_key IN ('_mdsm_ed25519_sig', '_mdsm_ed25519_signed_at', '_mdsm_ed25519_dsse')"
+    );
+
+    // Delete SLH-DSA signing post meta.
+    $wpdb->query(
+        "DELETE FROM {$wpdb->postmeta}
+         WHERE meta_key IN ('_mdsm_slhdsa_sig', '_mdsm_slhdsa_signed_at', '_mdsm_slhdsa_dsse', '_mdsm_slhdsa_param')"
+    );
+
+    // Delete ECDSA signing post meta.
+    $wpdb->query(
+        "DELETE FROM {$wpdb->postmeta}
+         WHERE meta_key IN ('_mdsm_ecdsa_sig', '_mdsm_ecdsa_cert', '_mdsm_ecdsa_signed_at', '_mdsm_ecdsa_dsse')"
+    );
+
+    // Delete RSA compatibility signing post meta.
+    $wpdb->query(
+        "DELETE FROM {$wpdb->postmeta}
+         WHERE meta_key IN ('_mdsm_rsa_sig', '_mdsm_rsa_signed_at', '_mdsm_rsa_scheme', '_mdsm_rsa_pubkey')"
+    );
+
+    // Delete CMS / PKCS#7 signing post meta.
+    $wpdb->query(
+        "DELETE FROM {$wpdb->postmeta}
+         WHERE meta_key IN ('_mdsm_cms_sig', '_mdsm_cms_signed_at', '_mdsm_cms_key_source')"
+    );
+
+    // Delete JSON-LD / W3C Data Integrity post meta.
+    $wpdb->query(
+        "DELETE FROM {$wpdb->postmeta}
+         WHERE meta_key IN ('_mdsm_jsonld_proof', '_mdsm_jsonld_signed_at', '_mdsm_jsonld_suite')"
+    );
+
+    // Securely wipe ECDSA PEM files stored on disk (key, cert, CA bundle).
+    $ecdsa_pem_paths = array(
+        get_option( 'archiviomd_ecdsa_key_path',  '' ),
+        get_option( 'archiviomd_ecdsa_cert_path', '' ),
+        get_option( 'archiviomd_ecdsa_ca_path',   '' ),
+    );
+    foreach ( $ecdsa_pem_paths as $pem_path ) {
+        if ( $pem_path && file_exists( $pem_path ) ) {
+            $len = filesize( $pem_path );
+            if ( $len > 0 ) {
+                file_put_contents( $pem_path, str_repeat( "\0", $len ) );
+            }
+            @unlink( $pem_path );
+        }
+    }
+
+    // Securely wipe RSA PEM files stored on disk (key, cert).
+    $rsa_pem_paths = array(
+        get_option( 'archiviomd_rsa_key_path',  '' ),
+        get_option( 'archiviomd_rsa_cert_path', '' ),
+    );
+    foreach ( $rsa_pem_paths as $pem_path ) {
+        if ( $pem_path && file_exists( $pem_path ) ) {
+            $len = filesize( $pem_path );
+            if ( $len > 0 ) {
+                file_put_contents( $pem_path, str_repeat( "\0", $len ) );
+            }
+            @unlink( $pem_path );
+        }
+    }
+    // Remove the PEM storage directory if empty.
+    $pem_dir = dirname( wp_upload_dir()['basedir'] ) . '/archiviomd-pem';
+    if ( is_dir( $pem_dir ) ) {
+        // Only remove if empty (or only contains our .htaccess guard).
+        $remaining = array_diff( scandir( $pem_dir ), array( '.', '..', '.htaccess' ) );
+        if ( empty( $remaining ) ) {
+            @unlink( $pem_dir . '/.htaccess' );
+            @rmdir( $pem_dir );
+        }
+    }
     
+    // Delete DANE health-check transients.
+    delete_transient( 'archiviomd_dane_health' );
+    delete_transient( 'archiviomd_dane_tlsa_health' );
+
+    // Unschedule DANE passive cron check.
+    $dane_ts = wp_next_scheduled( 'archiviomd_dane_cron_check' );
+    if ( $dane_ts ) {
+        wp_unschedule_event( $dane_ts, 'archiviomd_dane_cron_check' );
+    }
+
     // Drop the audit log table
     $audit_table = $wpdb->prefix . 'archivio_post_audit';
     $wpdb->query( $wpdb->prepare( "DROP TABLE IF EXISTS %i", $audit_table ) );
@@ -102,7 +225,41 @@ function archiviomd_uninstall_cleanup() {
         wp_delete_post($page_id, true);
     }
     
-    // IMPORTANT: Markdown files in the uploads/meta-docs/ directory are NOT deleted
+    // 6. Delete Canary Token settings, log table, and derived user meta.
+    //
+    // Canary Token options are stored under obfuscated keys (prefix 'ac_')
+    // whose exact names are site-specific (seeded from the site URL).
+    // We reconstruct the same opt() map here so we delete exactly the right
+    // keys without touching any other plugin's options that happen to use
+    // the 'ac_' prefix.
+    $ct_seed = md5( get_site_url() );
+    $ct_logicals = array(
+        'enabled', 'contractions', 'synonyms', 'punctuation',
+        'spelling', 'hyphenation', 'numbers', 'punctuation2',
+        'citation', 'parity', 'wordcount',
+        'payload_version', 'key_fingerprint', 'key_rotation_id',
+        'cache_health', 'cache_notice_dismissed', 'cache_check_url',
+        'cache_check_time', 'db_version',
+        'key_rotated', 'key_rotated_from', 'key_warn_dismissed',
+    );
+    foreach ( $ct_logicals as $ct_logical ) {
+        $ct_option = 'ac_' . substr( md5( $ct_seed . ':' . $ct_logical ), 0, 8 );
+        delete_option( $ct_option );
+    }
+    // Also delete DMCA contact fields (stored under plain option names).
+    foreach ( array( 'name', 'title', 'company', 'email', 'phone', 'address', 'website' ) as $ct_field ) {
+        delete_option( 'archivio_dmca_' . $ct_field );
+    }
+    // Drop the discovery log table.
+    $ct_log_table = $wpdb->prefix . 'archivio_canary_log';
+    $wpdb->query( "DROP TABLE IF EXISTS `{$ct_log_table}`" ); // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+    // Remove per-user dismiss meta (fallback-key notice and cache notice).
+    $wpdb->delete( $wpdb->usermeta, array( 'meta_key' => 'archivio_fallback_key_dismissed' ) );
+    $wpdb->delete( $wpdb->usermeta, array( 'meta_key' => 'archivio_cache_notice_dismissed' ) );
+    // Remove per-post canary disable flag.
+    $wpdb->delete( $wpdb->postmeta, array( 'meta_key' => '_archivio_canary_disabled' ) );
+
+
     // IMPORTANT: Generated sitemaps and HTML files are NOT deleted
     // These files are considered site content, not plugin data
     // Administrators must manually delete these files if desired

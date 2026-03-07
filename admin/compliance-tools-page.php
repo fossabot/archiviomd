@@ -300,14 +300,35 @@ wp_localize_script( 'mdsm-compliance-tools-js', 'mdsmComplianceData', array(
     'executeRestoreNonce' => wp_create_nonce( 'mdsm_execute_restore' ),
 ) );
 // Pass signing availability so the JS helper can label the sig notice correctly.
-$mdsm_signing_on = (
-    class_exists( 'MDSM_Ed25519_Signing' )
-    && MDSM_Ed25519_Signing::is_sodium_available()
-    && MDSM_Ed25519_Signing::is_private_key_defined()
+// True when at least one signing algorithm is fully configured and ready.
+$mdsm_ed25519_on = (
+	MDSM_Ed25519_Signing::is_mode_enabled() &&
+	MDSM_Ed25519_Signing::is_private_key_defined() &&
+	MDSM_Ed25519_Signing::is_sodium_available()
 );
+$mdsm_slhdsa_on = (
+	MDSM_SLHDSA_Signing::is_mode_enabled() &&
+	MDSM_SLHDSA_Signing::is_private_key_defined()
+);
+$mdsm_ecdsa_on = MDSM_ECDSA_Signing::status()['ready'];
+
+$mdsm_rsa_on    = class_exists( 'MDSM_RSA_Signing' )    ? MDSM_RSA_Signing::status()['ready']    : false;
+$mdsm_cms_on    = class_exists( 'MDSM_CMS_Signing' )    ? MDSM_CMS_Signing::status()['ready']    : false;
+$mdsm_jsonld_on = class_exists( 'MDSM_JSONLD_Signing' ) ? MDSM_JSONLD_Signing::status()['ready'] : false;
+
+$mdsm_signing_on    = $mdsm_ed25519_on || $mdsm_slhdsa_on || $mdsm_ecdsa_on || $mdsm_rsa_on || $mdsm_cms_on || $mdsm_jsonld_on;
+$mdsm_signing_parts = array();
+if ( $mdsm_ed25519_on ) { $mdsm_signing_parts[] = 'Ed25519'; }
+if ( $mdsm_slhdsa_on  ) { $mdsm_signing_parts[] = esc_js( MDSM_SLHDSA_Signing::get_param() ); }
+if ( $mdsm_ecdsa_on   ) { $mdsm_signing_parts[] = 'ECDSA P-256'; }
+if ( $mdsm_rsa_on     ) { $mdsm_signing_parts[] = 'RSA'; }
+if ( $mdsm_cms_on     ) { $mdsm_signing_parts[] = 'CMS/PKCS#7'; }
+if ( $mdsm_jsonld_on  ) { $mdsm_signing_parts[] = 'JSON-LD'; }
+$mdsm_signing_label = implode( ' + ', $mdsm_signing_parts );
 wp_add_inline_script(
     'mdsm-compliance-tools-js',
-    'window.mdsmSigningEnabled = ' . ( $mdsm_signing_on ? 'true' : 'false' ) . ';',
+    'window.mdsmSigningEnabled = ' . ( $mdsm_signing_on ? 'true' : 'false' ) . ';'
+    . 'window.mdsmSigningLabel = ' . wp_json_encode( $mdsm_signing_label ) . ';',
     'before'
 );
 ?>
@@ -323,11 +344,11 @@ jQuery(document).ready(function($) {
                 '<div style="padding: 10px 14px; background: #e7f5e9; border-left: 4px solid #008a00; display: flex; align-items: center; gap: 12px;">' +
                 '<span class="dashicons dashicons-lock" style="color: #008a00; font-size: 18px; flex-shrink: 0;"></span>' +
                 '<div style="flex: 1;">' +
-                '<strong style="color: #008a00;">' + ( window.mdsmSigningEnabled ? '✓ Export signed with Ed25519' : '✓ Integrity receipt generated' ) + '</strong>' +
+                '<strong style="color: #008a00;">' + ( window.mdsmSigningEnabled ? '✓ Export signed with ' + window.mdsmSigningLabel : '✓ Integrity receipt generated' ) + '</strong>' +
                 '<p style="margin: 2px 0 0 0; font-size: 12px; color: #555;">' +
                 'A <code>.sig.json</code> file has been generated alongside this export. ' +
                 'It contains a SHA-256 integrity hash' +
-                ( window.mdsmSigningEnabled ? ' and an Ed25519 signature' : '' ) +
+                ( window.mdsmSigningEnabled ? ' and a ' + window.mdsmSigningLabel + ' signature' : '' ) +
                 ' binding the filename, export type, site URL, and timestamp. ' +
                 'Keep it with the export file for auditable verification.' +
                 '</p>' +

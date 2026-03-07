@@ -18,6 +18,26 @@ class MDSM_Compliance_Tools {
      * Single instance of the class
      */
     private static $instance = null;
+
+    /**
+     * Confirm a resolved filepath is confined within an expected directory.
+     *
+     * Uses realpath() so symlinks and '..' sequences cannot escape the boundary.
+     * Returns false if the file does not exist yet; call after wp_mkdir_p() has
+     * created the parent directory so realpath() on dirname() works reliably.
+     *
+     * @param string $filepath     The candidate file path to check.
+     * @param string $allowed_dir  The directory it must resolve inside.
+     * @return bool True if safe, false otherwise.
+     */
+    private static function is_path_confined( string $filepath, string $allowed_dir ): bool {
+        $real_dir  = realpath( $allowed_dir );
+        $real_file = realpath( dirname( $filepath ) );
+        if ( false === $real_dir || false === $real_file ) {
+            return false;
+        }
+        return str_starts_with( $real_file . DIRECTORY_SEPARATOR, $real_dir . DIRECTORY_SEPARATOR );
+    }
     
     /**
      * Get single instance
@@ -291,8 +311,15 @@ class MDSM_Compliance_Tools {
         }
         
         $upload_dir = wp_upload_dir();
-        $filepath = $upload_dir['basedir'] . '/archivio-md-temp/' . $filename;
-        
+        $temp_dir   = $upload_dir['basedir'] . '/archivio-md-temp';
+        $filepath   = $temp_dir . '/' . $filename;
+
+        // Confine the resolved path to the temp directory — defence against
+        // sanitize_file_name() edge-cases or symlink tricks.
+        if ( ! self::is_path_confined( $filepath, $temp_dir ) ) {
+            wp_die( 'Invalid file path' );
+        }
+
         if (!file_exists($filepath)) {
             wp_die('File not found');
         }
@@ -548,8 +575,13 @@ class MDSM_Compliance_Tools {
         }
         
         $upload_dir = wp_upload_dir();
-        $filepath = $upload_dir['basedir'] . '/archivio-md-temp/' . $filename;
-        
+        $temp_dir   = $upload_dir['basedir'] . '/archivio-md-temp';
+        $filepath   = $temp_dir . '/' . $filename;
+
+        if ( ! self::is_path_confined( $filepath, $temp_dir ) ) {
+            wp_die( 'Invalid file path' );
+        }
+
         if (!file_exists($filepath)) {
             wp_die('File not found');
         }
@@ -628,7 +660,20 @@ class MDSM_Compliance_Tools {
         if ($zip->open($uploaded_file['tmp_name']) !== true) {
             throw new Exception('Failed to open backup archive');
         }
-        
+
+        // Zip slip guard: reject any entry whose name contains a path traversal
+        // sequence or an absolute path before we allow extractTo() to run.
+        for ( $i = 0; $i < $zip->numFiles; $i++ ) {
+            $entry = $zip->getNameIndex( $i );
+            if ( $entry === false ) { continue; }
+            if ( strpos( $entry, '..' ) !== false || strpos( $entry, '\\' ) !== false
+                    || substr( $entry, 0, 1 ) === '/' ) {
+                $zip->close();
+                $this->delete_directory( $extract_dir );
+                throw new Exception( 'Invalid backup: archive contains unsafe file paths.' );
+            }
+        }
+
         $zip->extractTo($extract_dir);
         $zip->close();
         
@@ -1052,7 +1097,12 @@ class MDSM_Compliance_Tools {
 		}
 
 		$upload_dir = wp_upload_dir();
-		$filepath   = $upload_dir['basedir'] . '/archivio-md-temp/' . $filename;
+		$temp_dir   = $upload_dir['basedir'] . '/archivio-md-temp';
+		$filepath   = $temp_dir . '/' . $filename;
+
+		if ( ! self::is_path_confined( $filepath, $temp_dir ) ) {
+			wp_die( esc_html__( 'Invalid file path.', 'archiviomd' ) );
+		}
 
 		if ( ! file_exists( $filepath ) ) {
 			wp_die( esc_html__( 'Export file not found. Please generate a new export.', 'archiviomd' ) );
@@ -1192,6 +1242,7 @@ class MDSM_Compliance_Tools {
 					'current_hash' => $current_hash,
 					'hash_history' => $hash_history,
 					'anchor_log'   => $anchor_log,
+					'signatures'   => $this->build_post_signature_block( $post_id ),
 				);
 			}
 
@@ -1330,6 +1381,202 @@ class MDSM_Compliance_Tools {
 	// ── Export Signing ───────────────────────────────────────────────────────
 
 	/**
+	 * Build the signatures block for a single post in the compliance JSON export.
+	 *
+	 * Returns a structured array covering Ed25519, SLH-DSA, and ECDSA P-256 — whichever are
+	 * configured.  Each entry records what is stored in post meta so the export
+	 * is a self-contained evidence package: the signature hex, algorithm, key
+	 * fingerprint, public key URL, and the DSSE envelope if present.
+	 *
+	 * @param  int $post_id
+	 * @return array
+	 */
+	private function build_post_signature_block( int $post_id ): array {
+		$block = array();
+
+		// ── Ed25519 ──────────────────────────────────────────────────────────
+		if ( class_exists( 'MDSM_Ed25519_Signing' ) ) {
+			$sig_hex   = get_post_meta( $post_id, '_mdsm_ed25519_sig',       true );
+			$signed_at = get_post_meta( $post_id, '_mdsm_ed25519_signed_at', true );
+			$dsse_raw  = get_post_meta( $post_id, MDSM_Ed25519_Signing::DSSE_META_KEY, true );
+
+			if ( $sig_hex ) {
+				$ed_entry = array(
+					'algorithm'      => 'Ed25519',
+					'standard'       => 'RFC 8032',
+					'signature'      => $sig_hex,
+					'signed_at'      => $signed_at ? gmdate( 'Y-m-d\TH:i:s\Z', (int) $signed_at ) : null,
+					'public_key_url' => home_url( '/.well-known/ed25519-pubkey.txt' ),
+					'key_fingerprint'=> MDSM_Ed25519_Signing::public_key_fingerprint() ?: null,
+				);
+
+				if ( $dsse_raw ) {
+					$dsse_arr = json_decode( $dsse_raw, true );
+					// Only include the Ed25519 signature entry from a potentially
+					// multi-sig envelope — avoid duplicating the SLH-DSA entry here.
+					if ( is_array( $dsse_arr ) ) {
+						$ed_sigs = array_values( array_filter(
+							(array) ( $dsse_arr['signatures'] ?? array() ),
+							static fn( $s ) => ! isset( $s['alg'] ) || $s['alg'] === 'ed25519'
+						) );
+						$ed_entry['dsse_envelope'] = array(
+							'payload'     => $dsse_arr['payload']     ?? null,
+							'payloadType' => $dsse_arr['payloadType'] ?? null,
+							'signatures'  => $ed_sigs,
+						);
+					}
+				}
+
+				$block['ed25519'] = $ed_entry;
+			} else {
+				$block['ed25519'] = array( 'status' => 'unsigned' );
+			}
+		}
+
+		// ── SLH-DSA ──────────────────────────────────────────────────────────
+		if ( class_exists( 'MDSM_SLHDSA_Signing' ) ) {
+			$slh_sig   = get_post_meta( $post_id, MDSM_SLHDSA_Signing::META_SIG,       true );
+			$slh_at    = get_post_meta( $post_id, MDSM_SLHDSA_Signing::META_SIGNED_AT,  true );
+			$slh_param = get_post_meta( $post_id, MDSM_SLHDSA_Signing::META_PARAM,      true );
+			$slh_dsse  = get_post_meta( $post_id, MDSM_SLHDSA_Signing::META_DSSE,       true );
+
+			if ( $slh_sig ) {
+				$slh_entry = array(
+					'algorithm'      => strtoupper( $slh_param ?: MDSM_SLHDSA_Signing::get_param() ),
+					'standard'       => 'NIST FIPS 205',
+					'signature'      => $slh_sig,
+					'signed_at'      => $slh_at ? gmdate( 'Y-m-d\TH:i:s\Z', (int) $slh_at ) : null,
+					'public_key_url' => home_url( '/.well-known/slhdsa-pubkey.txt' ),
+					'key_fingerprint'=> MDSM_SLHDSA_Signing::public_key_fingerprint() ?: null,
+				);
+
+				if ( $slh_dsse ) {
+					$slh_dsse_arr = json_decode( $slh_dsse, true );
+					if ( is_array( $slh_dsse_arr ) ) {
+						$slh_entry['dsse_envelope'] = $slh_dsse_arr;
+					}
+				}
+
+				$block['slh_dsa'] = $slh_entry;
+			} else {
+				$block['slh_dsa'] = array( 'status' => 'unsigned' );
+			}
+		}
+
+		// ── ECDSA P-256 ───────────────────────────────────────────────────────
+		if ( class_exists( 'MDSM_ECDSA_Signing' ) ) {
+			$ecdsa_sig  = get_post_meta( $post_id, MDSM_ECDSA_Signing::META_SIG,       true );
+			$ecdsa_at   = get_post_meta( $post_id, MDSM_ECDSA_Signing::META_SIGNED_AT,  true );
+			$ecdsa_dsse = get_post_meta( $post_id, MDSM_ECDSA_Signing::META_DSSE,       true );
+			$ecdsa_cert = get_post_meta( $post_id, MDSM_ECDSA_Signing::META_CERT,       true );
+
+			if ( $ecdsa_sig ) {
+				$cert_fingerprint = null;
+				if ( $ecdsa_cert ) {
+					$b64              = preg_replace( '/-----[^-]+-----|\s/', '', $ecdsa_cert );
+					$der              = base64_decode( $b64 ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions
+					$cert_fingerprint = hash( 'sha256', $der );
+				}
+
+				$ecdsa_entry = array(
+					'algorithm'        => 'ecdsa-p256-sha256',
+					'standard'         => 'NIST P-256 / secp256r1, X.509',
+					'signature'        => $ecdsa_sig,
+					'signed_at'        => $ecdsa_at ? gmdate( 'Y-m-d\TH:i:s\Z', (int) $ecdsa_at ) : null,
+					'certificate_url'  => home_url( '/.well-known/ecdsa-cert.pem' ),
+					'cert_fingerprint' => $cert_fingerprint,
+					'mode'             => 'enterprise_compliance',
+				);
+
+				if ( $ecdsa_dsse ) {
+					$ecdsa_dsse_arr = json_decode( $ecdsa_dsse, true );
+					if ( is_array( $ecdsa_dsse_arr ) ) {
+						$display = $ecdsa_dsse_arr;
+						if ( isset( $display['signatures'] ) ) {
+							foreach ( $display['signatures'] as &$s ) { unset( $s['x5c'] ); }
+							unset( $s );
+						}
+						$ecdsa_entry['dsse_envelope'] = $display;
+					}
+				}
+
+				$block['ecdsa_p256'] = $ecdsa_entry;
+			} else {
+				$block['ecdsa_p256'] = array( 'status' => 'unsigned' );
+			}
+		}
+
+		// ── RSA Compatibility Signing ─────────────────────────────────────────
+		if ( class_exists( 'MDSM_RSA_Signing' ) ) {
+			$rsa_sig    = get_post_meta( $post_id, MDSM_RSA_Signing::META_SIG,       true );
+			$rsa_at     = get_post_meta( $post_id, MDSM_RSA_Signing::META_SIGNED_AT,  true );
+			$rsa_scheme = get_post_meta( $post_id, MDSM_RSA_Signing::META_SCHEME,     true );
+			$rsa_pubkey = get_post_meta( $post_id, MDSM_RSA_Signing::META_PUBKEY,     true );
+
+			if ( $rsa_sig ) {
+				$rsa_entry = array(
+					'algorithm'      => strtoupper( $rsa_scheme ?: MDSM_RSA_Signing::get_scheme() ),
+					'standard'       => 'PKCS#1 / RSASSA-PSS, SHA-256',
+					'signature'      => $rsa_sig,
+					'signed_at'      => $rsa_at ? gmdate( 'Y-m-d\TH:i:s\Z', (int) $rsa_at ) : null,
+					'public_key_url' => home_url( '/.well-known/rsa-pubkey.pem' ),
+					'mode'           => 'legacy_compatibility',
+				);
+				if ( $rsa_pubkey ) {
+					$rsa_entry['pubkey_fingerprint'] = hash( 'sha256', hex2bin( $rsa_pubkey ) );
+				}
+				$block['rsa'] = $rsa_entry;
+			} else {
+				$block['rsa'] = array( 'status' => 'unsigned' );
+			}
+		}
+
+		// ── CMS / PKCS#7 Detached Signature ──────────────────────────────────
+		if ( class_exists( 'MDSM_CMS_Signing' ) ) {
+			$cms_sig    = get_post_meta( $post_id, MDSM_CMS_Signing::META_SIG,        true );
+			$cms_at     = get_post_meta( $post_id, MDSM_CMS_Signing::META_SIGNED_AT,  true );
+			$cms_source = get_post_meta( $post_id, MDSM_CMS_Signing::META_KEY_SOURCE, true );
+
+			if ( $cms_sig ) {
+				$block['cms_pkcs7'] = array(
+					'algorithm'   => 'CMS SignedData (RFC 5652), DER-encoded',
+					'standard'    => 'RFC 5652 / PKCS#7',
+					'signature'   => $cms_sig,
+					'signed_at'   => $cms_at ? gmdate( 'Y-m-d\TH:i:s\Z', (int) $cms_at ) : null,
+					'key_source'  => $cms_source ?: null,
+					'mode'        => 'enterprise_compatibility',
+				);
+			} else {
+				$block['cms_pkcs7'] = array( 'status' => 'unsigned' );
+			}
+		}
+
+		// ── JSON-LD / W3C Data Integrity ──────────────────────────────────────
+		if ( class_exists( 'MDSM_JSONLD_Signing' ) ) {
+			$proof_json = get_post_meta( $post_id, MDSM_JSONLD_Signing::META_PROOF,     true );
+			$jsonld_at  = get_post_meta( $post_id, MDSM_JSONLD_Signing::META_SIGNED_AT, true );
+			$suite      = get_post_meta( $post_id, MDSM_JSONLD_Signing::META_SUITE,     true );
+
+			if ( $proof_json ) {
+				$proof_arr = json_decode( $proof_json, true );
+				$block['jsonld_data_integrity'] = array(
+					'cryptosuite'  => $suite ?: 'unknown',
+					'standard'     => 'W3C Data Integrity 1.0',
+					'proof'        => is_array( $proof_arr ) ? $proof_arr : null,
+					'signed_at'    => $jsonld_at ? gmdate( 'Y-m-d\TH:i:s\Z', (int) $jsonld_at ) : null,
+					'did_url'      => home_url( '/.well-known/did.json' ),
+					'spec_url'     => 'https://www.w3.org/TR/vc-data-integrity/',
+				);
+			} else {
+				$block['jsonld_data_integrity'] = array( 'status' => 'unsigned' );
+			}
+		}
+
+		return $block;
+	}
+
+
+	/**
 	 * Generate a signature envelope for an export file and write it as a
 	 * sidecar `{filename}.sig.json` in the same temp directory.
 	 *
@@ -1415,9 +1662,197 @@ class MDSM_Compliance_Tools {
 			$envelope['signing_status']        = 'unavailable';
 			$envelope['signing_status_detail'] = 'Ed25519 mode is enabled but ext-sodium or the private key constant is missing.';
 		} else {
-			// Ed25519 not configured — integrity hash only.
+			// Ed25519 not configured — integrity hash only (may be upgraded by SLH-DSA below).
 			$envelope['signing_status']        = 'unsigned';
-			$envelope['signing_status_detail'] = 'Ed25519 signing is not configured. Configure it in Archivio Post → Settings to enable signed exports.';
+			$envelope['signing_status_detail'] = 'Ed25519 signing is not configured.';
+		}
+
+		// ── SLH-DSA signing (optional, degrades gracefully) ──────────────────
+		// Runs independently of Ed25519.  If both are active the receipt carries
+		// two independent quantum-classical signature blocks over the same canonical
+		// message — verifiers can check either or both.
+		$slhdsa_available = (
+			class_exists( 'MDSM_SLHDSA_Signing' )
+			&& MDSM_SLHDSA_Signing::is_mode_enabled()
+			&& MDSM_SLHDSA_Signing::is_private_key_defined()
+		);
+
+		if ( $slhdsa_available ) {
+			$slh_sig = MDSM_SLHDSA_Signing::sign( $canonical );
+
+			if ( ! is_wp_error( $slh_sig ) ) {
+				$envelope['slh_dsa'] = array(
+					'signature'      => $slh_sig,
+					'param'          => MDSM_SLHDSA_Signing::get_param(),
+					'signed_at'      => $generated_at,
+					'canonical_msg'  => $canonical,
+					'public_key_url' => trailingslashit( $site_url ) . '.well-known/slhdsa-pubkey.txt',
+					'standard'       => 'NIST FIPS 205',
+				);
+				// Upgrade signing_status to reflect that at least one sig exists.
+				if ( $envelope['signing_status'] === 'unsigned' ) {
+					$envelope['signing_status']        = 'signed';
+					$envelope['signing_status_detail'] = 'Signed with SLH-DSA only (Ed25519 not configured).';
+				} else {
+					// Both algorithms signed — record it.
+					$envelope['signing_status'] = 'signed';
+					unset( $envelope['signing_status_detail'] );
+				}
+			} else {
+				$envelope['slh_dsa_error'] = $slh_sig->get_error_message();
+			}
+		} elseif ( class_exists( 'MDSM_SLHDSA_Signing' ) && MDSM_SLHDSA_Signing::is_mode_enabled() ) {
+			$envelope['slh_dsa_status']        = 'unavailable';
+			$envelope['slh_dsa_status_detail'] = 'SLH-DSA mode is enabled but the private key constant is missing.';
+		}
+
+		// ── ECDSA P-256 signing (optional, degrades gracefully) ───────────────
+		// Enterprise / Compliance Mode only. Runs independently of Ed25519 and
+		// SLH-DSA. Certificate is validated (including expiry + CA chain) before
+		// signing. Nonce generation fully delegated to OpenSSL.
+		$ecdsa_available = (
+			class_exists( 'MDSM_ECDSA_Signing' )
+			&& MDSM_ECDSA_Signing::is_mode_enabled()
+			&& MDSM_ECDSA_Signing::is_openssl_available()
+		);
+
+		if ( $ecdsa_available ) {
+			$ecdsa_sig = MDSM_ECDSA_Signing::sign( $canonical );
+
+			if ( ! is_wp_error( $ecdsa_sig ) ) {
+				$cert_info = MDSM_ECDSA_Signing::certificate_info();
+				$envelope['ecdsa_p256'] = array(
+					'signature'       => $ecdsa_sig,
+					'algorithm'       => 'ecdsa-p256-sha256',
+					'signed_at'       => $generated_at,
+					'canonical_msg'   => $canonical,
+					'certificate_url' => trailingslashit( $site_url ) . '.well-known/ecdsa-cert.pem',
+					'cert_fingerprint'=> ( ! is_wp_error( $cert_info ) && isset( $cert_info['fingerprint'] ) ) ? $cert_info['fingerprint'] : null,
+					'standard'        => 'NIST P-256 / secp256r1, X.509',
+					'mode'            => 'enterprise_compliance',
+				);
+				if ( $envelope['signing_status'] === 'unsigned' ) {
+					$envelope['signing_status']        = 'signed';
+					$envelope['signing_status_detail'] = 'Signed with ECDSA P-256 only (Ed25519/SLH-DSA not configured).';
+				} else {
+					$envelope['signing_status'] = 'signed';
+					unset( $envelope['signing_status_detail'] );
+				}
+			} else {
+				$envelope['ecdsa_p256_error'] = $ecdsa_sig->get_error_message();
+			}
+		} elseif ( class_exists( 'MDSM_ECDSA_Signing' ) && MDSM_ECDSA_Signing::is_mode_enabled() ) {
+			$envelope['ecdsa_p256_status']        = 'unavailable';
+			$envelope['ecdsa_p256_status_detail'] = 'ECDSA mode is enabled but ext-openssl or the certificate is not configured.';
+		}
+
+		// ── RSA compatibility signing (optional, degrades gracefully) ─────────
+		$rsa_available = (
+			class_exists( 'MDSM_RSA_Signing' )
+			&& MDSM_RSA_Signing::is_mode_enabled()
+			&& MDSM_RSA_Signing::is_openssl_available()
+			&& MDSM_RSA_Signing::is_private_key_defined()
+		);
+
+		if ( $rsa_available ) {
+			$rsa_sig = MDSM_RSA_Signing::sign( $canonical );
+
+			if ( ! is_wp_error( $rsa_sig ) ) {
+				$envelope['rsa'] = array(
+					'signature'      => $rsa_sig,
+					'scheme'         => MDSM_RSA_Signing::get_scheme(),
+					'signed_at'      => $generated_at,
+					'canonical_msg'  => $canonical,
+					'public_key_url' => trailingslashit( $site_url ) . '.well-known/rsa-pubkey.pem',
+					'standard'       => 'PKCS#1 / RSASSA-PSS, SHA-256',
+					'mode'           => 'legacy_compatibility',
+				);
+				if ( $envelope['signing_status'] === 'unsigned' ) {
+					$envelope['signing_status']        = 'signed';
+					$envelope['signing_status_detail'] = 'Signed with RSA only (Ed25519/SLH-DSA/ECDSA not configured).';
+				} else {
+					$envelope['signing_status'] = 'signed';
+					unset( $envelope['signing_status_detail'] );
+				}
+			} else {
+				$envelope['rsa_error'] = $rsa_sig->get_error_message();
+			}
+		} elseif ( class_exists( 'MDSM_RSA_Signing' ) && MDSM_RSA_Signing::is_mode_enabled() ) {
+			$envelope['rsa_status']        = 'unavailable';
+			$envelope['rsa_status_detail'] = 'RSA mode is enabled but ext-openssl or the private key is not configured.';
+		}
+
+		// ── CMS / PKCS#7 signing (optional, degrades gracefully) ─────────────
+		$cms_available = (
+			class_exists( 'MDSM_CMS_Signing' )
+			&& MDSM_CMS_Signing::is_mode_enabled()
+			&& MDSM_CMS_Signing::is_openssl_available()
+			&& MDSM_CMS_Signing::is_key_available()
+		);
+
+		if ( $cms_available ) {
+			$cms_sig = MDSM_CMS_Signing::sign( $canonical );
+
+			if ( ! is_wp_error( $cms_sig ) ) {
+				$envelope['cms_pkcs7'] = array(
+					'signature'   => $cms_sig,
+					'algorithm'   => 'CMS SignedData (RFC 5652), DER base64',
+					'signed_at'   => $generated_at,
+					'canonical_msg' => $canonical,
+					'key_source'  => MDSM_CMS_Signing::get_key_source(),
+					'standard'    => 'RFC 5652 / PKCS#7',
+					'mode'        => 'enterprise_compatibility',
+				);
+				if ( $envelope['signing_status'] === 'unsigned' ) {
+					$envelope['signing_status']        = 'signed';
+					$envelope['signing_status_detail'] = 'Signed with CMS/PKCS#7 only.';
+				} else {
+					$envelope['signing_status'] = 'signed';
+					unset( $envelope['signing_status_detail'] );
+				}
+			} else {
+				$envelope['cms_pkcs7_error'] = $cms_sig->get_error_message();
+			}
+		} elseif ( class_exists( 'MDSM_CMS_Signing' ) && MDSM_CMS_Signing::is_mode_enabled() ) {
+			$envelope['cms_pkcs7_status']        = 'unavailable';
+			$envelope['cms_pkcs7_status_detail'] = 'CMS/PKCS#7 mode is enabled but no compatible key (ECDSA P-256 or RSA) is configured.';
+		}
+
+		// ── JSON-LD / W3C Data Integrity signing (optional, degrades gracefully) ─
+		$jsonld_available = (
+			class_exists( 'MDSM_JSONLD_Signing' )
+			&& MDSM_JSONLD_Signing::is_mode_enabled()
+			&& MDSM_JSONLD_Signing::is_signer_available()
+		);
+
+		if ( $jsonld_available ) {
+			$suite       = MDSM_JSONLD_Signing::get_active_suites();
+			$active_suite = ! empty( $suite ) ? $suite[0] : MDSM_JSONLD_Signing::SUITE_EDDSA;
+			$jsonld_proof = MDSM_JSONLD_Signing::sign( $canonical, $active_suite );
+
+			if ( ! is_wp_error( $jsonld_proof ) ) {
+				$envelope['jsonld_data_integrity'] = array(
+					'proof'        => $jsonld_proof,
+					'cryptosuite'  => $active_suite,
+					'signed_at'    => $generated_at,
+					'canonical_msg'=> $canonical,
+					'did_url'      => trailingslashit( $site_url ) . '.well-known/did.json',
+					'standard'     => 'W3C Data Integrity 1.0',
+					'spec_url'     => 'https://www.w3.org/TR/vc-data-integrity/',
+				);
+				if ( $envelope['signing_status'] === 'unsigned' ) {
+					$envelope['signing_status']        = 'signed';
+					$envelope['signing_status_detail'] = 'Signed with JSON-LD Data Integrity only.';
+				} else {
+					$envelope['signing_status'] = 'signed';
+					unset( $envelope['signing_status_detail'] );
+				}
+			} else {
+				$envelope['jsonld_error'] = $jsonld_proof->get_error_message();
+			}
+		} elseif ( class_exists( 'MDSM_JSONLD_Signing' ) && MDSM_JSONLD_Signing::is_mode_enabled() ) {
+			$envelope['jsonld_status']        = 'unavailable';
+			$envelope['jsonld_status_detail'] = 'JSON-LD mode is enabled but no compatible signing algorithm (Ed25519 or ECDSA P-256) is active.';
 		}
 
 		// ── Write sidecar ────────────────────────────────────────────────────
@@ -1452,7 +1887,12 @@ class MDSM_Compliance_Tools {
 		}
 
 		$upload_dir = wp_upload_dir();
-		$filepath   = $upload_dir['basedir'] . '/archivio-md-temp/' . $filename;
+		$temp_dir   = $upload_dir['basedir'] . '/archivio-md-temp';
+		$filepath   = $temp_dir . '/' . $filename;
+
+		if ( ! self::is_path_confined( $filepath, $temp_dir ) ) {
+			wp_die( esc_html__( 'Invalid file path.', 'archiviomd' ) );
+		}
 
 		if ( ! file_exists( $filepath ) ) {
 			wp_die( esc_html__( 'Signature file not found. Please regenerate the export.', 'archiviomd' ) );

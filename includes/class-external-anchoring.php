@@ -1003,6 +1003,77 @@ class MDSM_External_Anchoring {
 		$is_hmac    = ( $unpacked['mode'] === MDSM_Hash_Helper::MODE_HMAC );
 		$hmac_value = $is_hmac ? $hash_result['hash'] : null;
 
+		// ── Ed25519 signature (if enabled and signed) ───────────────────────
+		$ed25519_sig      = null;
+		$ed25519_key_url  = null;
+		if ( class_exists( 'MDSM_Ed25519_Signing' ) && MDSM_Ed25519_Signing::is_mode_enabled() ) {
+			$stored_sig = get_post_meta( $post_id, '_mdsm_ed25519_sig', true );
+			if ( $stored_sig ) {
+				$ed25519_sig     = $stored_sig;
+				$ed25519_key_url = trailingslashit( get_site_url() ) . '.well-known/ed25519-pubkey.txt';
+			}
+		}
+
+		// ── SLH-DSA signature (if enabled and signed) ────────────────────────
+		$slhdsa_sig      = null;
+		$slhdsa_param    = null;
+		$slhdsa_key_url  = null;
+		if ( class_exists( 'MDSM_SLHDSA_Signing' ) && MDSM_SLHDSA_Signing::is_mode_enabled() ) {
+			$stored_slh = get_post_meta( $post_id, '_mdsm_slhdsa_sig', true );
+			if ( $stored_slh ) {
+				$slhdsa_sig     = $stored_slh;
+				$slhdsa_param   = get_post_meta( $post_id, '_mdsm_slhdsa_param', true ) ?: MDSM_SLHDSA_Signing::get_param();
+				$slhdsa_key_url = trailingslashit( get_site_url() ) . '.well-known/slhdsa-pubkey.txt';
+			}
+		}
+
+		// ── ECDSA P-256 signature (if enabled and signed) ─────────────────────
+		$ecdsa_sig      = null;
+		$ecdsa_cert_url = null;
+		if ( class_exists( 'MDSM_ECDSA_Signing' ) && MDSM_ECDSA_Signing::is_mode_enabled() ) {
+			$stored_ecdsa = get_post_meta( $post_id, '_mdsm_ecdsa_sig', true );
+			if ( $stored_ecdsa ) {
+				$ecdsa_sig      = $stored_ecdsa;
+				$ecdsa_cert_url = trailingslashit( get_site_url() ) . '.well-known/ecdsa-cert.pem';
+			}
+		}
+
+		// ── RSA compatibility signature (if enabled and signed) ───────────────
+		$rsa_sig        = null;
+		$rsa_pubkey_url = null;
+		$rsa_scheme     = null;
+		if ( class_exists( 'MDSM_RSA_Signing' ) && MDSM_RSA_Signing::is_mode_enabled() ) {
+			$stored_rsa = get_post_meta( $post_id, MDSM_RSA_Signing::META_SIG, true );
+			if ( $stored_rsa ) {
+				$rsa_sig        = $stored_rsa;
+				$rsa_pubkey_url = trailingslashit( get_site_url() ) . '.well-known/rsa-pubkey.pem';
+				$rsa_scheme     = get_post_meta( $post_id, MDSM_RSA_Signing::META_SCHEME, true )
+				                  ?: MDSM_RSA_Signing::get_scheme();
+			}
+		}
+
+		// ── CMS / PKCS#7 signature (if enabled and signed) ────────────────────
+		$cms_sig        = null;
+		$cms_key_source = null;
+		if ( class_exists( 'MDSM_CMS_Signing' ) && MDSM_CMS_Signing::is_mode_enabled() ) {
+			$stored_cms = get_post_meta( $post_id, MDSM_CMS_Signing::META_SIG, true );
+			if ( $stored_cms ) {
+				$cms_sig        = $stored_cms;
+				$cms_key_source = get_post_meta( $post_id, MDSM_CMS_Signing::META_KEY_SOURCE, true ) ?: null;
+			}
+		}
+
+		// ── JSON-LD / W3C Data Integrity proof (if enabled and present) ───────
+		$jsonld_proof = null;
+		$jsonld_suite = null;
+		if ( class_exists( 'MDSM_JSONLD_Signing' ) && MDSM_JSONLD_Signing::is_mode_enabled() ) {
+			$stored_proof = get_post_meta( $post_id, MDSM_JSONLD_Signing::META_PROOF, true );
+			if ( $stored_proof ) {
+				$jsonld_proof = $stored_proof;
+				$jsonld_suite = get_post_meta( $post_id, MDSM_JSONLD_Signing::META_SUITE, true ) ?: null;
+			}
+		}
+
 		$record = array(
 			'document_id'    => 'post-' . $post_id,
 			'post_id'        => $post_id,
@@ -1013,6 +1084,20 @@ class MDSM_External_Anchoring {
 			'hash_value'     => $hash_result['hash'],
 			'hmac_value'     => $hmac_value,
 			'integrity_mode' => $is_hmac ? 'HMAC' : 'Basic',
+			'ed25519_sig'    => $ed25519_sig,
+			'ed25519_pubkey' => $ed25519_key_url,
+			'slhdsa_sig'     => $slhdsa_sig,
+			'slhdsa_param'   => $slhdsa_param,
+			'slhdsa_pubkey'  => $slhdsa_key_url,
+			'ecdsa_sig'      => $ecdsa_sig,
+			'ecdsa_cert_url' => $ecdsa_cert_url,
+			'rsa_sig'        => $rsa_sig,
+			'rsa_pubkey_url' => $rsa_pubkey_url,
+			'rsa_scheme'     => $rsa_scheme,
+			'cms_sig'        => $cms_sig,
+			'cms_key_source' => $cms_key_source,
+			'jsonld_proof'   => $jsonld_proof,
+			'jsonld_suite'   => $jsonld_suite,
 			'author'         => get_the_author_meta( 'display_name', $post->post_author ),
 			'plugin_version' => MDSM_VERSION,
 			'site_url'       => get_site_url(),
@@ -1049,6 +1134,20 @@ class MDSM_External_Anchoring {
 			'hash_value'     => $hash_result['hash'],
 			'hmac_value'     => $hmac_value,
 			'integrity_mode' => $is_hmac ? 'HMAC' : 'Basic',
+			'ed25519_sig'    => null,
+			'ed25519_pubkey' => null,
+			'slhdsa_sig'     => null,
+			'slhdsa_param'   => null,
+			'slhdsa_pubkey'  => null,
+			'ecdsa_sig'      => null,
+			'ecdsa_cert_url' => null,
+			'rsa_sig'        => null,
+			'rsa_pubkey_url' => null,
+			'rsa_scheme'     => null,
+			'cms_sig'        => null,
+			'cms_key_source' => null,
+			'jsonld_proof'   => null,
+			'jsonld_suite'   => null,
 			'author'         => $user ? $user->display_name : 'unknown',
 			// No timestamp_utc — signing time comes from the TSA, not from here.
 			'plugin_version' => MDSM_VERSION,
@@ -1284,7 +1383,7 @@ class MDSM_External_Anchoring {
 		}
 
 		$table_name = $wpdb->prefix . 'archivio_post_audit';
-		if ( $wpdb->get_var( "SHOW TABLES LIKE '{$table_name}'" ) !== $table_name ) {
+		if ( $wpdb->get_var( $wpdb->prepare( "SHOW TABLES LIKE %s", $wpdb->esc_like( $table_name ) ) ) !== $table_name ) {
 			return;
 		}
 
@@ -1702,10 +1801,10 @@ class MDSM_External_Anchoring {
 			wp_send_json_error( array( 'message' => __( 'Insufficient permissions.', 'archiviomd' ) ) );
 		}
 
-		$page      = isset( $_POST['page'] ) ? max( 1, intval( $_POST['page'] ) ) : 1;
+		$page      = isset( $_POST['page'] ) ? max( 1, absint( wp_unslash( $_POST['page'] ) ) ) : 1;
 		$per_page  = 25;
-		$filter    = isset( $_POST['filter'] )    ? sanitize_key( $_POST['filter'] )    : 'all';
-		$log_scope = isset( $_POST['log_scope'] ) ? sanitize_key( $_POST['log_scope'] ) : 'all';
+		$filter    = isset( $_POST['filter'] )    ? sanitize_key( wp_unslash( $_POST['filter'] ) )    : 'all';
+		$log_scope = isset( $_POST['log_scope'] ) ? sanitize_key( wp_unslash( $_POST['log_scope'] ) ) : 'all';
 
 		$result = MDSM_Anchor_Log::get_entries( $page, $per_page, $filter, $log_scope );
 
@@ -2273,7 +2372,7 @@ class MDSM_Anchor_Log {
 			wp_send_json_error( array( 'message' => __( 'Insufficient permissions.', 'archiviomd' ) ) );
 		}
 
-		$log_index  = isset( $_POST['log_index'] )  ? absint( $_POST['log_index'] )                                          : 0;
+		$log_index  = isset( $_POST['log_index'] )  ? absint( wp_unslash( $_POST['log_index'] ) )                                          : 0;
 		$local_hash = isset( $_POST['local_hash'] ) ? sanitize_text_field( wp_unslash( $_POST['local_hash'] ) ) : '';
 
 		if ( $log_index <= 0 ) {

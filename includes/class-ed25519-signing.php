@@ -551,6 +551,14 @@ class MDSM_Ed25519_Signing {
 		$output .= "\n";
 		$output .= $pubkey . "\n";
 
+		// Append dns-record hint when DANE corroboration is enabled so external
+		// verifiers know exactly which DNS TXT record to query.
+		if ( class_exists( 'MDSM_DANE_Corroboration' ) && MDSM_DANE_Corroboration::is_enabled() ) {
+			$output .= "\n";
+			$output .= "# dns-record: " . MDSM_DANE_Corroboration::dns_record_name( 'ed25519' ) . "\n";
+			$output .= "# discovery:  " . home_url( '/.well-known/' . MDSM_DANE_Corroboration::JSON_SLUG ) . "\n";
+		}
+
 		header( 'Content-Type: text/plain; charset=utf-8' );
 		header( 'X-Robots-Tag: noindex' );
 		nocache_headers();

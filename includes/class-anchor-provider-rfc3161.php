@@ -563,6 +563,42 @@ class MDSM_Anchor_Provider_RFC3161 implements MDSM_Anchor_Provider_Interface {
 		// If a custom URL is explicitly set, use it regardless of provider slug.
 		$custom = isset( $settings['rfc3161_custom_url'] ) ? trim( $settings['rfc3161_custom_url'] ) : '';
 		if ( $custom !== '' ) {
+			// SSRF guard: only allow http:// and https:// schemes, and reject
+			// URLs whose hostname resolves to a private or reserved IP range
+			// (loopback, link-local, RFC 1918, etc.).
+			$parsed = wp_parse_url( $custom );
+			if ( empty( $parsed['scheme'] ) || ! in_array( strtolower( $parsed['scheme'] ), array( 'http', 'https' ), true ) ) {
+				return ''; // Unsupported scheme — refuse to connect.
+			}
+			$host = isset( $parsed['host'] ) ? $parsed['host'] : '';
+			if ( $host === '' ) {
+				return '';
+			}
+			// Strip IPv6 brackets for filter_var().
+			$host_bare = trim( $host, '[]' );
+			// If the host is a bare IP, validate it directly.
+			if ( filter_var( $host_bare, FILTER_VALIDATE_IP ) ) {
+				if ( ! filter_var( $host_bare, FILTER_VALIDATE_IP,
+						FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE ) ) {
+					return ''; // Private/reserved IP — refuse.
+				}
+			} else {
+				// Hostname: resolve to IP(s) and check every record.
+				$records = dns_get_record( $host, DNS_A | DNS_AAAA );
+				if ( empty( $records ) ) {
+					return ''; // Unresolvable host — refuse.
+				}
+				foreach ( $records as $rec ) {
+					$ip = isset( $rec['ip'] ) ? $rec['ip'] : ( isset( $rec['ipv6'] ) ? $rec['ipv6'] : '' );
+					if ( $ip === '' ) {
+						continue;
+					}
+					if ( ! filter_var( $ip, FILTER_VALIDATE_IP,
+							FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE ) ) {
+						return ''; // At least one record resolves to private range — refuse.
+					}
+				}
+			}
 			return $custom;
 		}
 

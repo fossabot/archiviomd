@@ -137,6 +137,27 @@ class MDSM_File_Manager {
                 'message' => 'Could not determine file path'
             );
         }
+
+        // Confine the destination to expected directories — ABSPATH, .well-known,
+        // or wp_upload_dir() basedir. Guards against path traversal in $file_name.
+        $upload_dir    = wp_upload_dir();
+        $allowed_roots = array(
+            realpath( ABSPATH ),
+            realpath( $upload_dir['basedir'] ),
+        );
+        $real_dest_dir = realpath( dirname( $file_path ) );
+        $confined = false;
+        if ( $real_dest_dir ) {
+            foreach ( $allowed_roots as $root ) {
+                if ( $root && str_starts_with( $real_dest_dir . DIRECTORY_SEPARATOR, $root . DIRECTORY_SEPARATOR ) ) {
+                    $confined = true;
+                    break;
+                }
+            }
+        }
+        if ( ! $confined ) {
+            return array( 'success' => false, 'message' => 'Destination path is outside allowed directories.' );
+        }
         
         // Ensure directory exists
         $dir = dirname($file_path);

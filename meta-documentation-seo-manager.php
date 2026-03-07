@@ -3,7 +3,7 @@
  * Plugin Name: ArchivioMD
  * Plugin URI: https://mountainviewprovisions.com/ArchivioMD
  * Description: Manage meta-docs, SEO files, and sitemaps with audit tools and HTML-rendered Markdown support.
- * Version: 1.7.0
+ * Version: 1.17.6
  * Author: Mountain View Provisions LLC
  * Author URI: https://mountainviewprovisions.com/
  * Requires at least: 5.0
@@ -19,7 +19,7 @@ if (!defined('ABSPATH')) {
 }
 
 // Define plugin constants
-define('MDSM_VERSION', '1.7.0');
+define('MDSM_VERSION', '1.17.6');
 define('MDSM_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('MDSM_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('MDSM_PLUGIN_BASENAME', plugin_basename(__FILE__));
@@ -72,6 +72,15 @@ class Meta_Documentation_SEO_Manager {
 
         // Initialize Ed25519 Document Signing (singleton)
         MDSM_Ed25519_Signing::get_instance();
+        MDSM_SLHDSA_Signing::get_instance();
+        MDSM_ECDSA_Signing::get_instance();
+        MDSM_RSA_Signing::get_instance();
+        MDSM_CMS_Signing::get_instance();
+        MDSM_JSONLD_Signing::get_instance();
+        MDSM_DANE_Corroboration::get_instance();
+
+        // Initialize Canary Token fingerprinting (singleton)
+        MDSM_Canary_Token::get_instance();
         
         // Initialize admin
         if (is_admin()) {
@@ -99,6 +108,9 @@ class Meta_Documentation_SEO_Manager {
         add_action('save_post', array($this, 'maybe_auto_update_sitemap'));
         add_action('delete_post', array($this, 'maybe_auto_update_sitemap'));
         
+        // Load plugin textdomain for translations (must run on init or later)
+        add_action('init', array($this, 'load_textdomain'));
+
         // Add rewrite rules and serve files
         add_action('init', array($this, 'add_rewrite_rules'));
         add_filter('query_vars', array($this, 'add_query_vars'));
@@ -108,7 +120,19 @@ class Meta_Documentation_SEO_Manager {
         register_activation_hook(__FILE__, array($this, 'activate'));
         register_deactivation_hook(__FILE__, array($this, 'deactivate'));
     }
-    
+
+    /**
+     * Load plugin textdomain for translations.
+     * Hooked to 'init' to satisfy WP 6.7+ requirements.
+     */
+    public function load_textdomain() {
+        load_plugin_textdomain(
+            'archiviomd',
+            false,
+            dirname( plugin_basename( __FILE__ ) ) . '/languages'
+        );
+    }
+
     /**
      * Load required files
      */
@@ -126,6 +150,14 @@ class Meta_Documentation_SEO_Manager {
         require_once MDSM_PLUGIN_DIR . 'includes/class-archivio-post.php';
         require_once MDSM_PLUGIN_DIR . 'includes/class-external-anchoring.php';
         require_once MDSM_PLUGIN_DIR . 'includes/class-ed25519-signing.php';
+        require_once MDSM_PLUGIN_DIR . 'includes/class-slhdsa-signing.php';
+        require_once MDSM_PLUGIN_DIR . 'includes/class-ecdsa-signing.php';
+        require_once MDSM_PLUGIN_DIR . 'includes/class-rsa-signing.php';
+        require_once MDSM_PLUGIN_DIR . 'includes/class-cms-signing.php';
+        require_once MDSM_PLUGIN_DIR . 'includes/class-jsonld-signing.php';
+        require_once MDSM_PLUGIN_DIR . 'includes/class-dane-corroboration.php';
+        require_once MDSM_PLUGIN_DIR . 'includes/class-canary-token.php';
+        require_once MDSM_PLUGIN_DIR . 'includes/class-cache-compat.php';
 
         // WP-CLI commands — loaded only when CLI is active, invisible at runtime.
         if ( defined( 'WP_CLI' ) && WP_CLI ) {
@@ -767,6 +799,48 @@ class Meta_Documentation_SEO_Manager {
             'index.php?mdsm_file=ed25519-pubkey.txt',
             'top'
         );
+
+        // Well-known endpoint for SLH-DSA public key.
+        add_rewrite_rule(
+            '^\.well-known/slhdsa-pubkey.txt$',
+            'index.php?mdsm_file=slhdsa-pubkey.txt',
+            'top'
+        );
+
+        // Well-known endpoint for ECDSA leaf certificate.
+        add_rewrite_rule(
+            '^\.well-known/ecdsa-cert.pem$',
+            'index.php?mdsm_file=ecdsa-cert.pem',
+            'top'
+        );
+
+        // Well-known endpoint for RSA public key (Extended / compatibility mode).
+        add_rewrite_rule(
+            '^\.well-known/rsa-pubkey.pem$',
+            'index.php?mdsm_file=rsa-pubkey.pem',
+            'top'
+        );
+
+        // Well-known endpoint for W3C DID document (JSON-LD / Data Integrity).
+        add_rewrite_rule(
+            '^\.well-known/did.json$',
+            'index.php?mdsm_file=did.json',
+            'top'
+        );
+
+        // Well-known endpoint for DANE DNS discovery document.
+        add_rewrite_rule(
+            '^\.well-known/archiviomd-dns\.json$',
+            'index.php?mdsm_file=archiviomd-dns.json',
+            'top'
+        );
+
+        // Well-known endpoint for DANE DNS format specification.
+        add_rewrite_rule(
+            '^\.well-known/archiviomd-dns-spec\.json$',
+            'index.php?mdsm_file=archiviomd-dns-spec.json',
+            'top'
+        );
     }
     
     /**
@@ -790,6 +864,44 @@ class Meta_Documentation_SEO_Manager {
         // ── Ed25519 public key well-known endpoint ──────────────────────
         if ( $file === 'ed25519-pubkey.txt' ) {
             MDSM_Ed25519_Signing::serve_public_key(); // exits
+        }
+
+        // ── SLH-DSA public key well-known endpoint ──────────────────────
+        if ( $file === 'slhdsa-pubkey.txt' ) {
+            MDSM_SLHDSA_Signing::serve_public_key(); // exits
+        }
+
+        // ── ECDSA leaf certificate well-known endpoint ───────────────────
+        if ( $file === 'ecdsa-cert.pem' ) {
+            MDSM_ECDSA_Signing::serve_certificate(); // exits
+        }
+
+        // ── RSA public key well-known endpoint ───────────────────────────
+        if ( $file === 'rsa-pubkey.pem' ) {
+            MDSM_RSA_Signing::serve_public_key(); // exits (stub: 404 until implemented)
+        }
+
+        // ── W3C DID document well-known endpoint ─────────────────────────
+        if ( $file === 'did.json' ) {
+            MDSM_JSONLD_Signing::serve_did_document(); // exits
+        }
+
+        // ── DANE DNS discovery document ───────────────────────────────────
+        if ( $file === 'archiviomd-dns.json' ) {
+            if ( class_exists( 'MDSM_DANE_Corroboration' ) ) {
+                MDSM_DANE_Corroboration::serve_dns_json(); // exits
+            }
+            status_header( 404 );
+            exit;
+        }
+
+        // ── DANE DNS format specification ─────────────────────────────────
+        if ( $file === 'archiviomd-dns-spec.json' ) {
+            if ( class_exists( 'MDSM_DANE_Corroboration' ) ) {
+                MDSM_DANE_Corroboration::serve_dns_spec(); // exits
+            }
+            status_header( 404 );
+            exit;
         }
         
         // Determine file type
@@ -923,6 +1035,12 @@ class Meta_Documentation_SEO_Manager {
         
         // Create External Anchoring log table
         MDSM_Anchor_Log::create_table();
+
+        // Create Canary Token discovery log table
+        MDSM_Canary_Token::create_log_table();
+
+        // Schedule daily cache health check for canary Unicode stripping detection
+        MDSM_Canary_Token::schedule_cache_check();
         
         // Schedule anchoring cron
         MDSM_External_Anchoring::activate_cron();
@@ -941,6 +1059,9 @@ class Meta_Documentation_SEO_Manager {
         
         // Unschedule anchoring cron
         MDSM_External_Anchoring::deactivate_cron();
+
+        // Unschedule canary cache health check
+        MDSM_Canary_Token::unschedule_cache_check();
     }
 }
 
@@ -951,3 +1072,24 @@ function mdsm_init() {
 
 // Start the plugin
 add_action('plugins_loaded', 'mdsm_init');
+
+// Cache compatibility layer — must run after mdsm_init so MDSM_Canary_Token
+// is available, but early enough that our ob_start wraps any caching plugin
+// that also hooks template_redirect.  plugins_loaded priority 15 achieves this.
+add_action( 'plugins_loaded', function() {
+	MDSM_Canary_Cache_Compat::get_instance();
+}, 15 );
+
+/**
+ * Run lightweight upgrade checks on every load.
+ * Creates the canary discovery log table for sites that were already active
+ * before 1.10.0 (activation hook only fires on fresh installs / re-activations).
+ */
+add_action( 'plugins_loaded', function() {
+    $db_ver = get_option( 'archiviomd_db_version', '0' );
+    if ( version_compare( $db_ver, '1.10.0', '<' ) ) {
+        MDSM_Canary_Token::create_log_table();
+        MDSM_Canary_Token::schedule_cache_check();
+        update_option( 'archiviomd_db_version', '1.10.0', false );
+    }
+}, 20 );
